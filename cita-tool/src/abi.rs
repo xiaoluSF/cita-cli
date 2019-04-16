@@ -1,36 +1,37 @@
 use std::fs::File;
 use std::io::Read;
 
-use super::LowerHex;
+use crate::LowerHex;
 use ethabi::param_type::{ParamType, Reader};
 use ethabi::token::{LenientTokenizer, StrictTokenizer, Token, Tokenizer};
 use ethabi::{decode, encode, Contract, Hash};
 use hex::{decode as hex_decode, encode as hex_encode};
 use types::U256;
 
-use error::ToolError;
+use crate::error::ToolError;
 
 pub fn parse_tokens(params: &[(ParamType, &str)], lenient: bool) -> Result<Vec<Token>, ToolError> {
     params
         .iter()
         .map(|&(ref param, value)| {
             if lenient {
-                if format!("{}", param) == "uint256" {
+                let type_name = format!("{}", param);
+                if type_name.starts_with("uint") && type_name.find(']').is_none() {
                     let y = U256::from_dec_str(value)
                         .map_err(|_| "Can't parse into u256")?
-                        .lower_hex();
-                    StrictTokenizer::tokenize(param, &format!("{:0>64}", y))
-                } else if format!("{}", param) == "int256" {
+                        .completed_lower_hex();
+                    StrictTokenizer::tokenize(param, &y)
+                } else if type_name.starts_with("int") && type_name.find(']').is_none() {
                     let x = if value.starts_with('-') {
                         let x = (!U256::from_dec_str(&value[1..])
                             .map_err(|_| "Can't parse into u256")?
-                            + U256::from(1)).lower_hex();
+                            + U256::from(1))
+                        .lower_hex();
                         format!("{:f>64}", x)
                     } else {
-                        let x = U256::from_dec_str(value)
+                        U256::from_dec_str(value)
                             .map_err(|_| "Can't parse into u256")?
-                            .lower_hex();
-                        format!("{:0>64}", x)
+                            .completed_lower_hex()
                     };
                     StrictTokenizer::tokenize(param, &x)
                 } else {
@@ -39,8 +40,9 @@ pub fn parse_tokens(params: &[(ParamType, &str)], lenient: bool) -> Result<Vec<T
             } else {
                 StrictTokenizer::tokenize(param, value)
             }
-        }).collect::<Result<_, _>>()
-        .map_err(|e| ToolError::Abi(format!("{}", e)))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| ToolError::Abi(e.to_string()))
 }
 
 /// According to the contract, encode the function and parameter values
@@ -165,7 +167,8 @@ pub fn decode_params(types: &[String], data: &str) -> Result<Vec<String>, ToolEr
             } else {
                 format!("{{\"{}\": \"{}\"}}", ty, to)
             }
-        }).collect::<Vec<String>>();
+        })
+        .collect::<Vec<String>>();
 
     Ok(result)
 }
@@ -197,7 +200,8 @@ pub fn decode_input(
             } else {
                 format!("{{\"{}\": \"{}\"}}", ty, to)
             }
-        }).collect::<Vec<String>>();
+        })
+        .collect::<Vec<String>>();
 
     Ok(result)
 }
@@ -217,7 +221,7 @@ pub fn decode_logs(
         .map_err(|e| ToolError::Abi(format!("{}", e)))?;
 
     let topics: Vec<Hash> = topics
-        .into_iter()
+        .iter()
         .map(|t| t.parse())
         .collect::<Result<_, _>>()
         .map_err(|e| ToolError::Abi(format!("{}", e)))?;
@@ -264,7 +268,8 @@ mod test {
             &["int".to_string()],
             &["-99999999999999999999999999999999999999999999999999999999999999999999".to_string()],
             true,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             b,
             "fffffffc4a717738acec1362cd61555e7046d08adea4e8f00000000000000001".to_string()
@@ -280,7 +285,8 @@ mod test {
             &["uint".to_string()],
             &["99999999999999999999999999999999999999999999999999999999999999999999".to_string()],
             true,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             d,
             "00000003b58e88c75313ec9d329eaaa18fb92f75215b170fffffffffffffffff".to_string()

@@ -9,8 +9,8 @@ mod tx_command;
 mod util;
 
 pub(crate) use self::util::{
-    encryption, get_url, h256_validator, is_hex, parse_address, parse_height, parse_privkey,
-    parse_u256, parse_u32, parse_u64, privkey_validator, pubkey_validator, search_app,
+    encryption, get_url, h256_validator, is_hex, key_validator, parse_address, parse_height,
+    parse_privkey, parse_u256, parse_u32, parse_u64, search_app,
 };
 
 pub use self::abi_command::{abi_command, abi_processor};
@@ -26,7 +26,7 @@ pub use self::store_command::{store_command, store_processor};
 pub use self::tx_command::{tx_command, tx_processor};
 
 use cita_tool::parse_url;
-use clap::{App, AppSettings, Arg, SubCommand};
+use clap::{crate_version, App, AppSettings, Arg, SubCommand};
 
 /// Generate cli
 pub fn build_cli(version: &str) -> App {
@@ -58,12 +58,14 @@ pub fn build_cli(version: &str) -> App {
                 .takes_value(true)
                 .possible_values(&["secp256k1", "ed25519", "sm2"])
                 .help("Select the encryption algorithm you want, the default is secp256k1"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("no-color")
                 .long("no-color")
                 .global(true)
                 .help("Do not highlight(color) output json"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("debug")
                 .long("debug")
                 .global(true)
@@ -83,43 +85,51 @@ pub fn build_interactive() -> App<'static, 'static> {
             SubCommand::with_name("switch")
                 .about("Switch environment variables, such as url/algorithm")
                 .arg(
-                    Arg::with_name("host")
-                        .long("host")
+                    Arg::with_name("url")
+                        .long("url")
                         .validator(|url| parse_url(url.as_ref()).map(|_| ()))
                         .takes_value(true)
                         .help("Switch url"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("color")
                         .long("color")
                         .help("Switching color for rpc interface"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("algorithm")
                         .long("algorithm")
                         .takes_value(true)
                         .possible_values(&["secp256k1", "ed25519", "sm2"])
                         .help("Select the encryption algorithm you want, the default is secp256k1"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("debug")
                         .long("debug")
                         .help("Switching debug mode"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("json")
                         .long("json")
                         .help("Switching json format"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("completion_style")
                         .long("completion_style")
                         .help("Switching completion style"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("edit_style")
                         .long("edit_style")
                         .help("Switching edit style"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("save_private")
                         .long("save_private")
                         .help("Switching whether save private key"),
                 ),
-        ).subcommand(search_command())
+        )
+        .subcommand(search_command())
         .subcommand(SubCommand::with_name("info").about("Display global variables"))
         .subcommand(rpc_command())
         .subcommand(key_command())
@@ -134,7 +144,8 @@ pub fn build_interactive() -> App<'static, 'static> {
             SubCommand::with_name("exit")
                 .visible_alias("quit")
                 .about("Exit the interactive interface"),
-        ).subcommand(
+        )
+        .subcommand(
             SubCommand::with_name("set")
                 .about("Set temporary variables")
                 .arg(
@@ -142,13 +153,15 @@ pub fn build_interactive() -> App<'static, 'static> {
                         .required(true)
                         .index(1)
                         .help("The name of variable"),
-                ).arg(
+                )
+                .arg(
                     Arg::with_name("value")
                         .required(true)
                         .index(2)
                         .help("Variable value"),
                 ),
-        ).subcommand(
+        )
+        .subcommand(
             SubCommand::with_name("get")
                 .about("Get variable value")
                 .arg(Arg::with_name("key").index(1).help("The name of variable")),

@@ -22,17 +22,17 @@ use rustyline::hint::Hinter;
 use rustyline::{Cmd, CompletionType, Config, EditMode, Editor, Helper, KeyPress};
 
 use regex::{Captures, Regex};
-use serde_json;
+use serde_json::{self, json};
 use shell_words;
 
-use cita_tool::client::basic::Client;
-use cita_tool::{Encryption, JsonRpcResponse};
-use cli::{
+use crate::cli::{
     abi_processor, amend_processor, benchmark_processor, build_interactive, contract_processor,
-    encryption, key_processor, privkey_validator, rpc_processor, search_processor, store_processor,
+    encryption, key_processor, key_validator, rpc_processor, search_processor, store_processor,
     string_include, transfer_processor, tx_processor,
 };
-use printer::{OutputFormat, Printable, Printer};
+use crate::printer::{OutputFormat, Printable, Printer};
+use cita_tool::client::basic::Client;
+use cita_tool::{Encryption, JsonRpcResponse};
 
 const ASCII_WORD: &str = r#"
    ._____. ._____.  _. ._   ._____. ._____.   ._.   ._____. ._____.
@@ -93,6 +93,17 @@ pub fn start(url: &str, client: &Client) -> io::Result<()> {
         config.set_completion_style(configs["completion_style"].as_bool().unwrap_or(true));
         config.set_edit_style(configs["edit_style"].as_bool().unwrap_or(true));
         config.set_save_private(configs["save_private"].as_bool().unwrap_or(false));
+    }
+
+    let mut env_file = cita_cli_dir.clone();
+    env_file.push("env_vars");
+    if env_file.as_path().exists() {
+        let file = fs::File::open(&env_file)?;
+        let env_vars_json = serde_json::from_reader(file).unwrap_or(json!(null));
+        match env_vars_json {
+            serde_json::Value::Object(env_vars) => config.env_variable.extend(env_vars),
+            _ => eprintln!("Parse environment variable file failed."),
+        }
     }
 
     let mut printer = Printer::default();
@@ -213,8 +224,8 @@ fn handle_commands(
     match parser.clone().get_matches_from_safe(args) {
         Ok(matches) => match matches.subcommand() {
             ("switch", Some(m)) => {
-                m.value_of("host").and_then(|host| {
-                    config.set_url(host.to_string());
+                m.value_of("url").and_then(|url| {
+                    config.set_url(url.to_string());
                     Some(())
                 });
                 if m.is_present("color") {
@@ -257,7 +268,8 @@ fn handle_commands(
                     "completion_style": config.completion_style(),
                     "edit_style": config.edit_style(),
                     "save_private": config.save_private(),
-                })).unwrap();
+                }))
+                .unwrap();
                 file.write_all(content.as_bytes())
                     .map_err(|err| format!("save config error: {:?}", err))?;
                 Ok(())
@@ -296,7 +308,8 @@ fn handle_commands(
             _ => Ok(()),
         },
         Err(err) => Err(err.to_string()),
-    }.map(|_| false)
+    }
+    .map(|_| false)
 }
 
 struct CitaCompleter<'a, 'b>
@@ -320,7 +333,8 @@ impl<'a, 'b> CitaCompleter<'a, 'b> {
                 let names = vec![
                     short.map(|s| format!("-{}", s)),
                     long.map(|s| format!("--{}", s)),
-                ].into_iter()
+                ]
+                .into_iter()
                 .filter_map(|s| s)
                 .map(|s| {
                     let display = if required {
@@ -329,7 +343,8 @@ impl<'a, 'b> CitaCompleter<'a, 'b> {
                         s.clone()
                     };
                     (display, s)
-                }).collect::<Vec<(String, String)>>();
+                })
+                .collect::<Vec<(String, String)>>();
 
                 if !multiple && names.iter().any(|(_, s)| args_set.contains(&s)) {
                     vec![]
@@ -351,24 +366,28 @@ impl<'a, 'b> CitaCompleter<'a, 'b> {
                                 .iter()
                                 .map(|(alias, _)| (alias.to_string(), alias.to_string()))
                                 .collect::<Vec<(String, String)>>()
-                        }).unwrap_or_else(|| vec![]),
+                        })
+                        .unwrap_or_else(|| vec![]),
                 ]
-                    .concat()
-            }).chain(app.p.flags().map(|a| {
+                .concat()
+            })
+            .chain(app.p.flags().map(|a| {
                 switched_completions(
                     a.s.short,
                     a.s.long,
                     a.b.is_set(clap::ArgSettings::Multiple),
                     a.b.is_set(clap::ArgSettings::Required),
                 )
-            })).chain(app.p.opts().map(|a| {
+            }))
+            .chain(app.p.opts().map(|a| {
                 switched_completions(
                     a.s.short,
                     a.s.long,
                     a.b.is_set(clap::ArgSettings::Multiple),
                     a.b.is_set(clap::ArgSettings::Required),
                 )
-            })).collect::<Vec<Vec<(String, String)>>>()
+            }))
+            .collect::<Vec<Vec<(String, String)>>>()
             .concat()
     }
 
@@ -378,13 +397,14 @@ impl<'a, 'b> CitaCompleter<'a, 'b> {
     ) -> Option<Arc<clap::App<'a, 'b>>> {
         if let Some(name) = prefix_names.next() {
             for inner_app in &(app.p.subcommands) {
-                if inner_app.p.meta.name == name || inner_app
-                    .p
-                    .meta
-                    .aliases
-                    .as_ref()
-                    .map(|aliases| aliases.iter().any(|&(alias, _)| alias == name))
-                    .unwrap_or(false)
+                if inner_app.p.meta.name == name
+                    || inner_app
+                        .p
+                        .meta
+                        .aliases
+                        .as_ref()
+                        .map(|aliases| aliases.iter().any(|&(alias, _)| alias == name))
+                        .unwrap_or(false)
                 {
                     return if prefix_names.peek().is_none() {
                         Some(Arc::new(inner_app.to_owned()))
@@ -412,7 +432,8 @@ impl<'a, 'b> Completer for CitaCompleter<'a, 'b> {
         let tmp_pair = Self::find_subcommand(
             self.clap_app.clone(),
             args.iter().map(|s| s.as_str()).peekable(),
-        ).map(|current_app| Self::get_completions(&current_app, &args))
+        )
+        .map(|current_app| Self::get_completions(&current_app, &args))
         .unwrap_or_default();
 
         if word_lower.is_empty() {
@@ -422,7 +443,8 @@ impl<'a, 'b> Completer for CitaCompleter<'a, 'b> {
                 .map(|(display, replacement)| Pair {
                     display,
                     replacement,
-                }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
             Ok((start, pairs))
         } else {
             let pairs = tmp_pair
@@ -432,7 +454,8 @@ impl<'a, 'b> Completer for CitaCompleter<'a, 'b> {
                 .map(|(display, replacement)| Pair {
                     display,
                     replacement,
-                }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
             if pairs
                 .iter()
@@ -445,17 +468,20 @@ impl<'a, 'b> Completer for CitaCompleter<'a, 'b> {
                     .map(|(display, replacement)| Pair {
                         display,
                         replacement,
-                    }).collect::<Vec<_>>();
+                    })
+                    .collect::<Vec<_>>();
                 Ok((start, pairs))
             } else {
                 let pairs = tmp_pair
                     .into_iter()
                     .filter(|(_, replacement)| {
                         string_include(&replacement.to_lowercase(), &word_lower)
-                    }).map(|(display, replacement)| Pair {
+                    })
+                    .map(|(display, replacement)| Pair {
                         display,
                         replacement,
-                    }).collect::<Vec<_>>();
+                    })
+                    .collect::<Vec<_>>();
                 Ok((start, pairs))
             }
         }
@@ -482,7 +508,8 @@ impl<'a, 'b> Highlighter for CitaCompleter<'a, 'b> {
                 } else {
                     param.to_string()
                 }
-            }).collect::<Vec<String>>()
+            })
+            .collect::<Vec<String>>()
             .join("\n");
         Owned(candidate_with_color)
     }
@@ -566,7 +593,8 @@ impl GlobalConfig {
                                 },
                                 None => Err(()),
                             },
-                        ).unwrap_or_default(),
+                        )
+                        .unwrap_or_default(),
                     None => None,
                 };
                 KV::Value(value)
@@ -581,7 +609,11 @@ impl GlobalConfig {
     }
 
     pub fn set_url(&mut self, value: String) {
-        self.url = value;
+        if value.starts_with("http://") || value.starts_with("https://") {
+            self.url = value;
+        } else {
+            self.url = "http://".to_owned() + &value;
+        }
     }
 
     pub fn get_url(&self) -> &String {
@@ -708,7 +740,8 @@ impl GlobalConfig {
                     Yellow.paint(*value),
                     width = max_width
                 )
-            }).collect::<Vec<String>>()
+            })
+            .collect::<Vec<String>>()
             .join("\n");
         println!("{}", output);
     }
@@ -720,7 +753,7 @@ fn remove_private(line: &str) -> String {
             shell_words::split(line)
                 .unwrap()
                 .into_iter()
-                .filter(|key| privkey_validator(key).is_err())
+                .filter(|key| key_validator(key).is_err())
                 .collect::<Vec<String>>(),
         )
     } else {
@@ -737,10 +770,12 @@ fn replace_cmd(regex: &Regex, line: &str, config: &GlobalConfig) -> String {
                     serde_json::Value::String(s) => s.to_owned(),
                     serde_json::Value::Number(n) => n.to_string(),
                     _ => String::new(),
-                }).next()
+                })
+                .next()
                 .unwrap_or_default(),
             None => String::new(),
-        }).into_owned()
+        })
+        .into_owned()
 }
 
 pub fn set_output(response: &JsonRpcResponse, config: &mut GlobalConfig) {
@@ -795,7 +830,7 @@ mod test {
     fn test_re() {
         fn capture(regex: &Regex, line: &str) -> String {
             let replaced = regex.replace_all(line, |caps: &Captures| {
-                format!("{}", caps.name("key").unwrap().as_str())
+                caps.name("key").unwrap().as_str().to_string()
             });
             replaced.into_owned()
         }

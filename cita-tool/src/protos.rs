@@ -1,35 +1,45 @@
 pub mod blockchain;
 
 pub use self::blockchain::{Crypto, SignedTransaction, Transaction, UnverifiedTransaction};
-use client::remove_0x;
-use crypto::PubKey;
-use crypto::{pubkey_to_address, sign, Encryption, Hashable, KeyPair, PrivateKey, Signature};
+use crate::client::remove_0x;
+use crate::crypto::PubKey;
+use crate::crypto::{
+    pubkey_to_address, sign, Encryption, Hashable, KeyPair, PrivateKey, Signature,
+};
+use crate::LowerHex;
 use hex;
 use protobuf::Message as MessageTrait;
 use protobuf::{parse_from_bytes, ProtobufEnum};
-use serde_json::Value;
-use types::H256;
+use serde_json::{json, Value};
+use std::convert::From;
+use types::{Address, H256, U256};
 
-use error::ToolError;
+use crate::error::ToolError;
 use std::str::FromStr;
 
 impl UnverifiedTransaction {
     /// UnverifiedTransaction as JSON Value
     pub fn to_json(&self, encryption: Encryption) -> Result<Value, String> {
-        let tx = self.transaction.get_ref();
+        let tx = match self.transaction.as_ref() {
+            Some(tx) => tx,
+            None => return Err("Bad Transaction".to_string()),
+        };
         let pub_key = self.public_key(encryption)?;
         Ok(json!({
             "transaction": {
                 "to": tx.to,
+                "to_v1": Address::from(tx.to_v1.as_slice()).completed_lower_hex_with_0x(),
                 "nonce": tx.nonce,
                 "quota": tx.quota,
                 "valid_until_block": tx.valid_until_block,
                 "data": format!("0x{}", hex::encode(&tx.data)),
-                "value": tx.value,
+                "value": U256::from(tx.value.as_slice()).completed_lower_hex_with_0x(),
                 "chain_id": tx.chain_id,
+                "chain_id_v1": U256::from(tx.chain_id_v1.as_slice()).completed_lower_hex_with_0x(),
                 "version": tx.version,
-                "pub_key": pub_key.to_string(),
+                "pub_key": format!("0x{}", pub_key),
                 "sender": pubkey_to_address(&pub_key),
+                "encrypted_hash": tx.write_to_bytes().map_err(|e| e.to_string())?.crypt_hash(encryption)
             },
             "signature": format!("0x{}", hex::encode(&self.signature)),
             "crypto": self.crypto.value(),
@@ -38,7 +48,10 @@ impl UnverifiedTransaction {
 
     /// Get the transaction public key
     pub fn public_key(&self, encryption: Encryption) -> Result<PubKey, String> {
-        let bytes: Vec<u8> = self.get_transaction().write_to_bytes().unwrap();
+        let bytes: Vec<u8> = self
+            .get_transaction()
+            .write_to_bytes()
+            .map_err(|e| e.to_string())?;
         let hash = bytes.crypt_hash(encryption);
         let signature = self.get_signature();
         let sig = Signature::from(signature);
@@ -75,7 +88,6 @@ impl Transaction {
 
         let hash = match sk {
             PrivateKey::Secp256k1(_) => bytes.crypt_hash(Encryption::Secp256k1),
-            #[cfg(feature = "ed25519")]
             PrivateKey::Ed25519(_) => bytes.crypt_hash(Encryption::Ed25519),
             PrivateKey::Sm2(_) => bytes.crypt_hash(Encryption::Sm2),
             PrivateKey::Null => H256::default(),
@@ -93,7 +105,6 @@ impl Transaction {
 
         let hash = match sk {
             PrivateKey::Secp256k1(_) => bytes.crypt_hash(Encryption::Secp256k1),
-            #[cfg(feature = "ed25519")]
             PrivateKey::Ed25519(_) => bytes.crypt_hash(Encryption::Ed25519),
             PrivateKey::Sm2(_) => bytes.crypt_hash(Encryption::Sm2),
             PrivateKey::Null => H256::default(),

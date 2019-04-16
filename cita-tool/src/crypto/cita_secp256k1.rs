@@ -1,18 +1,20 @@
-use crypto::{
+use crate::crypto::{
     pubkey_to_address, CreateKey, Error, Message, PubKey, Secp256k1PrivKey, Secp256k1PubKey,
 };
 use hex::encode;
-use rand::thread_rng;
+use lazy_static::lazy_static;
 use secp256k1::{
-    key::{self, SecretKey},
-    Message as SecpMessage, RecoverableSignature, RecoveryId, Secp256k1,
+    constants,
+    key::{self, PublicKey, SecretKey},
+    rand::OsRng,
+    Error as SecpError, Message as SecpMessage, RecoverableSignature, RecoveryId, Secp256k1,
 };
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use types::{Address, H256};
 
 lazy_static! {
-    pub static ref SECP256K1: Secp256k1 = Secp256k1::new();
+    pub static ref SECP256K1: Secp256k1<secp256k1::All> = Secp256k1::new();
 }
 
 const SIGNATURE_BYTES_LEN: usize = 65;
@@ -40,12 +42,14 @@ impl CreateKey for Secp256k1KeyPair {
     /// Create a pair from secret key
     fn from_privkey(privkey: Self::PrivKey) -> Result<Self, Self::Error> {
         let context = &SECP256K1;
-        let s: key::SecretKey = key::SecretKey::from_slice(context, &privkey.0[..])?;
-        let pubkey = key::PublicKey::from_secret_key(context, &s)?;
-        let serialized = pubkey.serialize_vec(context, false);
+        let s: key::SecretKey = key::SecretKey::from_slice(&privkey.0[..])?;
+        let pubkey = key::PublicKey::from_secret_key(context, &s);
+        let serialized = pubkey.serialize_uncompressed();
 
         let mut pubkey = Secp256k1PubKey::default();
-        pubkey.0.copy_from_slice(&serialized[1..65]);
+        pubkey
+            .0
+            .copy_from_slice(&serialized[1..constants::UNCOMPRESSED_PUBLIC_KEY_SIZE]);
 
         let keypair = Secp256k1KeyPair { privkey, pubkey };
 
@@ -54,12 +58,14 @@ impl CreateKey for Secp256k1KeyPair {
 
     fn gen_keypair() -> Self {
         let context = &SECP256K1;
-        let (s, p) = context.generate_keypair(&mut thread_rng()).unwrap();
-        let serialized = p.serialize_vec(context, false);
+        let (s, p) = context.generate_keypair(&mut OsRng::new().unwrap());
+        let serialized = p.serialize_uncompressed();
         let mut privkey = Secp256k1PrivKey::default();
         privkey.0.copy_from_slice(&s[0..32]);
         let mut pubkey = Secp256k1PubKey::default();
-        pubkey.0.copy_from_slice(&serialized[1..65]);
+        pubkey
+            .0
+            .copy_from_slice(&serialized[1..constants::UNCOMPRESSED_PUBLIC_KEY_SIZE]);
         Secp256k1KeyPair { privkey, pubkey }
     }
 
@@ -106,35 +112,63 @@ impl Secp256k1Signature {
 
     /// Check if this is a "low" signature.
     pub fn is_low_s(&self) -> bool {
-        H256::from_slice(self.s())
+        H256::from(self.s())
             <= "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0".into()
     }
 
     /// Check if each component of the signature is in range.
     pub fn is_valid(&self) -> bool {
         self.v() <= 1
-            && H256::from_slice(self.r())
+            && H256::from(self.r())
                 < "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141".into()
-            && H256::from_slice(self.r()) >= 1.into()
-            && H256::from_slice(self.s())
+            && H256::from(self.r()) >= 1.into()
+            && H256::from(self.s())
                 < "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141".into()
-            && H256::from_slice(self.s()) >= 1.into()
+            && H256::from(self.s()) >= 1.into()
     }
 
     /// Recover public key
     pub fn recover(&self, message: &Message) -> Result<Secp256k1PubKey, Error> {
         let context = &SECP256K1;
         let rsig = RecoverableSignature::from_compact(
-            context,
             &self.0[0..64],
             RecoveryId::from_i32(i32::from(self.0[64] as i8))?,
         )?;
         let public = context.recover(&SecpMessage::from_slice(&message.0[..])?, &rsig)?;
-        let serialized = public.serialize_vec(context, false);
+        let serialized = public.serialize_uncompressed();
 
         let mut pubkey = Secp256k1PubKey::default();
-        pubkey.0.copy_from_slice(&serialized[1..65]);
+        pubkey
+            .0
+            .copy_from_slice(&serialized[1..constants::UNCOMPRESSED_PUBLIC_KEY_SIZE]);
         Ok(pubkey)
+    }
+
+    /// Verify public key
+    pub fn verify_public(
+        &self,
+        pubkey: &Secp256k1PubKey,
+        message: &Message,
+    ) -> Result<bool, Error> {
+        let context = &SECP256K1;
+        let rsig = RecoverableSignature::from_compact(
+            &self.0[0..64],
+            RecoveryId::from_i32(i32::from(self.0[64]))?,
+        )?;
+        let sig = rsig.to_standard();
+
+        let pdata: [u8; 65] = {
+            let mut temp = [4u8; 65];
+            temp[1..65].copy_from_slice(pubkey);
+            temp
+        };
+
+        let publ = PublicKey::from_slice(&pdata)?;
+        match context.verify(&SecpMessage::from_slice(&message.0[..])?, &sig, &publ) {
+            Ok(_) => Ok(true),
+            Err(SecpError::IncorrectSignature) => Ok(false),
+            Err(x) => Err(Error::from(x)),
+        }
     }
 }
 
@@ -146,8 +180,8 @@ pub fn secp256k1_sign(
     let context = &SECP256K1;
     // no way to create from raw byte array.
     let sec: &SecretKey = unsafe { &*(privkey as *const H256 as *const SecretKey) };
-    let s = context.sign_recoverable(&SecpMessage::from_slice(&message.0[..])?, sec)?;
-    let (rec_id, data) = s.serialize_compact(context);
+    let s = context.sign_recoverable(&SecpMessage::from_slice(&message.0[..])?, sec);
+    let (rec_id, data) = s.serialize_compact();
     let mut data_arr = [0; 65];
 
     // no need to check if s is low, it always is
@@ -216,7 +250,7 @@ mod tests {
     #[test]
     fn test_recover() {
         let keypair = Secp256k1KeyPair::gen_keypair();
-        let msg = Message::default();
+        let msg = Message::from([1; 32]);
         let sig = secp256k1_sign(keypair.privkey(), &msg).unwrap();
         assert_eq!(keypair.pubkey(), &sig.recover(&msg).unwrap());
     }

@@ -1,20 +1,5 @@
 #![deny(warnings)]
 
-extern crate ansi_term;
-extern crate atty;
-extern crate cita_tool;
-extern crate colored;
-#[macro_use]
-extern crate clap;
-extern crate dotenv;
-extern crate rustyline;
-extern crate serde;
-#[macro_use]
-extern crate serde_json;
-extern crate dirs;
-extern crate regex;
-extern crate shell_words;
-
 mod cli;
 mod interactive;
 mod json_color;
@@ -27,24 +12,30 @@ use std::process;
 use std::rc::Rc;
 
 use cita_tool::client::basic::Client;
+use clap::crate_version;
 use dotenv::dotenv;
 
 include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 
-use cli::{
+use crate::cli::{
     abi_processor, amend_processor, benchmark_processor, build_cli, completion_processor,
     contract_processor, key_processor, rpc_processor, search_processor, store_processor,
     transfer_processor, tx_processor,
 };
-use interactive::GlobalConfig;
-use printer::Printer;
+use crate::interactive::GlobalConfig;
+use crate::printer::Printer;
 
 const ENV_JSONRPC_URL: &str = "JSONRPC_URL";
 const DEFAULT_JSONRPC_URL: &str = "http://127.0.0.1:1337";
 
 fn main() {
     dotenv().ok();
-    let version = format!("{}+{}", crate_version!(), get_commit_id());
+    let version = format!(
+        "{}+{}, {}",
+        crate_version!(),
+        get_commit_id(),
+        feature_version()
+    );
 
     let mut env_map: HashMap<String, String> = HashMap::from_iter(env::vars());
     let default_jsonrpc_url = env_map
@@ -84,5 +75,13 @@ fn main() {
     } {
         printer.eprintln(&Rc::new(err.to_string()), true);
         process::exit(1);
+    }
+}
+
+fn feature_version() -> String {
+    if cfg!(feature = "tls") {
+        "support tls".to_owned()
+    } else {
+        "no other support".to_owned()
     }
 }

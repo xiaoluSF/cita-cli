@@ -4,7 +4,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use types::Address;
 
-use crypto::{pubkey_to_address, CreateKey, Error, Message, PubKey, Sm2Privkey, Sm2Pubkey};
+use crate::crypto::{pubkey_to_address, CreateKey, Error, Message, PubKey, Sm2Privkey, Sm2Pubkey};
 
 const SIGNATURE_BYTES_LEN: usize = 128;
 
@@ -94,6 +94,23 @@ impl Sm2Signature {
                     Err(Error::RecoverError)
                 }
             })
+    }
+
+    /// Verify public key
+    pub fn verify_public(&self, pubkey: &Sm2Pubkey, message: &Message) -> Result<bool, Error> {
+        let pubkey_from_sig = Sm2Pubkey::from(self.pk());
+        if pubkey_from_sig == *pubkey {
+            let ctx = SigCtx::new();
+            let sig = RawSignature::new(self.r(), self.s());
+            let mut pk_full = [0u8; 65];
+            pk_full[0] = 4;
+            pk_full[1..].copy_from_slice(self.pk());
+            ctx.load_pubkey(&pk_full[..])
+                .map_err(|_| Error::RecoverError)
+                .map(|pk| ctx.verify(&message, &pk, &sig))
+        } else {
+            Ok(false)
+        }
     }
 }
 

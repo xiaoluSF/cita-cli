@@ -4,17 +4,19 @@ use clap::{App, ArgMatches};
 
 use cita_tool::{remove_0x, Address, Encryption, PrivateKey, H256, H512, U256};
 
-use interactive::GlobalConfig;
+use crate::interactive::GlobalConfig;
 
 /// Get url from arg match
 pub fn get_url<'a>(m: &'a ArgMatches, config: &'a GlobalConfig) -> &'a str {
     match m.value_of("url") {
         Some(url) => url,
-        _ => if m.subcommand().1.is_some() {
-            get_url(m.subcommand().1.unwrap(), config)
-        } else {
-            config.get_url().as_str()
-        },
+        _ => {
+            if m.subcommand().1.is_some() {
+                get_url(m.subcommand().1.unwrap(), config)
+            } else {
+                config.get_url().as_str()
+            }
+        }
     }
 }
 
@@ -46,50 +48,12 @@ pub fn parse_privkey(hash: &str, encryption: Encryption) -> Result<PrivateKey, S
     Ok(PrivateKey::from_str(remove_0x(hash), encryption)?)
 }
 
-#[cfg(feature = "ed25519")]
-pub fn privkey_validator(hash: &str) -> Result<(), String> {
+pub fn key_validator(hash: &str) -> Result<(), String> {
     is_hex(hash)?;
     if hash.len() > 66 {
         h512_validator(hash)
     } else {
         h256_validator(hash)
-    }
-}
-
-#[cfg(not(feature = "ed25519"))]
-pub fn privkey_validator(hash: &str) -> Result<(), String> {
-    if hash.len() > 66 {
-        Err(
-            "The current version does not support 512-byte private keys, \
-             should build with feature blake2b_hash"
-                .to_string(),
-        )
-    } else {
-        h256_validator(hash)
-    }
-}
-
-#[cfg(feature = "ed25519")]
-pub fn pubkey_validator(hash: &str) -> Result<(), String> {
-    is_hex(hash)?;
-    if hash.len() < 66 {
-        h256_validator(hash)
-    } else {
-        h512_validator(hash)
-    }
-}
-
-#[cfg(not(feature = "ed25519"))]
-pub fn pubkey_validator(hash: &str) -> Result<(), String> {
-    is_hex(hash)?;
-    if hash.len() < 66 {
-        Err(
-            "The current version does not support 512-byte private keys, \
-             should build with feature blake2b_hash"
-                .to_string(),
-        )
-    } else {
-        h512_validator(hash)
     }
 }
 

@@ -3,11 +3,13 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{str, u64};
 
-use super::super::LowerHex;
+use crate::LowerHex;
 use failure::Fail;
 use futures::{future::join_all, future::JoinAll, sync, Future, Stream};
 use hex::{decode, encode};
-use hyper::{Body, Client as HyperClient, Request, Uri};
+use hyper::{client::HttpConnector, Body, Client as HyperClient, Request, Uri};
+#[cfg(feature = "tls")]
+use hyper_tls::HttpsConnector;
 use protobuf::{parse_from_bytes, Message};
 use serde;
 use serde_json;
@@ -15,17 +17,18 @@ use tokio;
 use types::U256;
 use uuid::Uuid;
 
-use abi::encode_params;
-use client::{remove_0x, TransactionOptions};
-use crypto::PrivateKey;
-use error::ToolError;
-use protos::{Transaction, UnverifiedTransaction};
-use rpctypes::{JsonRpcParams, JsonRpcResponse, ParamsValue, ResponseValue};
+use crate::abi::encode_params;
+use crate::client::{remove_0x, TransactionOptions};
+use crate::crypto::PrivateKey;
+use crate::error::ToolError;
+use crate::protos::{Transaction, UnverifiedTransaction};
+use crate::rpctypes::{JsonRpcParams, JsonRpcResponse, ParamsValue, ResponseValue};
 
 const BLOCK_NUMBER: &str = "blockNumber";
 const GET_META_DATA: &str = "getMetaData";
 const SEND_RAW_TRANSACTION: &str = "sendRawTransaction";
 const PEER_COUNT: &str = "peerCount";
+const PEERS_INFO: &str = "peersInfo";
 const GET_BLOCK_BY_HASH: &str = "getBlockByHash";
 const GET_BLOCK_BY_NUMBER: &str = "getBlockByNumber";
 const GET_TRANSACTION: &str = "getTransaction";
@@ -49,6 +52,8 @@ const GET_BLOCK_HEADER: &str = "getBlockHeader";
 const GET_STATE_PROOF: &str = "getStateProof";
 const GET_STORAGE_AT: &str = "getStorageAt";
 
+const GET_VERSION: &str = "getVersion";
+
 /// Store action target address
 pub const STORE_ADDRESS: &str = "0xffffffffffffffffffffffffffffffffff010000";
 /// StoreAbi action target address
@@ -62,8 +67,6 @@ pub const AMEND_ABI: &str = "0x01";
 pub const AMEND_CODE: &str = "0x02";
 /// amend the kv of db
 pub const AMEND_KV_H256: &str = "0x03";
-/// amend get the value of db
-pub const AMEND_GET_KV_H256: &str = "0x04";
 /// amend account balance
 pub const AMEND_BALANCE: &str = "0x05";
 
@@ -72,7 +75,7 @@ pub struct Client {
     id: AtomicUsize,
     url: Uri,
     sender: sync::mpsc::UnboundedSender<Box<dyn Future<Item = (), Error = ()> + Send + 'static>>,
-    chain_id: Option<u32>,
+    chain_id: Option<U256>,
     private_key: Option<PrivateKey>,
     debug: bool,
 }
@@ -88,7 +91,8 @@ impl Client {
                 .for_each(|item| {
                     tokio::spawn(item);
                     Ok(())
-                }).map_err(|_| ());
+                })
+                .map_err(|_| ());
 
             tokio::run(task);
         });
@@ -117,7 +121,7 @@ impl Client {
     }
 
     /// Set chain id
-    pub fn set_chain_id(&mut self, chain_id: u32) -> &mut Self {
+    pub fn set_chain_id(&mut self, chain_id: U256) -> &mut Self {
         self.chain_id = Some(chain_id);
         self
     }
@@ -153,9 +157,7 @@ impl Client {
         params: T,
     ) -> Result<Vec<JsonRpcResponse>, ToolError> {
         let params = params.collect::<Vec<JsonRpcParams>>();
-        if self.debug {
-            Self::debug_request(params.clone().iter())
-        }
+
         let reqs = self.make_requests_with_params_list(params.into_iter());
 
         self.run(reqs)
@@ -167,9 +169,6 @@ impl Client {
         url: T,
         params: JsonRpcParams,
     ) -> Result<Vec<JsonRpcResponse>, ToolError> {
-        if self.debug {
-            Self::debug_request(vec![&params].into_iter());
-        }
         let reqs = self.make_requests_with_all_url(url, params);
 
         self.run(reqs)
@@ -187,7 +186,12 @@ impl Client {
             "id",
             ParamsValue::Int(self.id.load(Ordering::Relaxed) as u64),
         );
-        let client = HyperClient::new();
+
+        if self.debug {
+            Self::debug_request(vec![&params].into_iter())
+        }
+
+        let client = create_client();
         let mut reqs = Vec::with_capacity(100);
         urls.for_each(|url| {
             let req: Request<Body> = Request::builder()
@@ -218,16 +222,21 @@ impl Client {
         params: T,
     ) -> JoinAll<Vec<Box<dyn Future<Item = JsonRpcResponse, Error = ToolError> + 'static + Send>>>
     {
-        let client = HyperClient::new();
+        let client = create_client();
         let mut reqs = Vec::with_capacity(100);
         params
             .map(|param| {
                 self.id.fetch_add(1, Ordering::Relaxed);
-                param.insert(
+                let param = param.insert(
                     "id",
                     ParamsValue::Int(self.id.load(Ordering::Relaxed) as u64),
-                )
-            }).for_each(|param| {
+                );
+                if self.debug {
+                    Self::debug_request(vec![&param].into_iter())
+                }
+                param
+            })
+            .for_each(|param| {
                 let req: Request<Body> = Request::builder()
                     .uri(self.url.clone())
                     .method("POST")
@@ -264,22 +273,38 @@ impl Client {
 
         let mut tx = Transaction::new();
         tx.set_data(data);
-        // Create a contract if the target address is empty
-        tx.set_to(remove_0x(transaction_options.address()).to_string());
+
         tx.set_nonce(encode(Uuid::new_v4().as_bytes()));
         tx.set_valid_until_block(current_height + 88);
         tx.set_quota(transaction_options.quota().unwrap_or_else(|| 10_000_000));
         let value = transaction_options
             .value()
-            .map(|value| value.lower_hex())
-            .unwrap_or_else(|| U256::zero().lower_hex());
-        tx.set_value(decode(format!("{:0>64}", value)).map_err(ToolError::Decode)?);
-        tx.set_chain_id(self.get_chain_id()?);
-        tx.set_version(
-            transaction_options
-                .version()
-                .unwrap_or_else(|| self.get_version().unwrap_or_else(|_| 0)),
-        );
+            .map(|value| value.completed_lower_hex())
+            .unwrap_or_else(|| U256::zero().completed_lower_hex());
+        tx.set_value(decode(value).map_err(ToolError::Decode)?);
+
+        let version = transaction_options
+            .version()
+            .unwrap_or_else(|| self.get_version().unwrap_or_else(|_| 0));
+
+        if version == 0 {
+            // Create a contract if the target address is empty
+            tx.set_to(remove_0x(transaction_options.address()).to_string());
+            tx.set_chain_id(self.get_chain_id()?);
+        } else if version == 1 {
+            // Create a contract if the target address is empty
+            tx.set_to_v1(
+                decode(remove_0x(transaction_options.address())).map_err(ToolError::Decode)?,
+            );
+            tx.set_chain_id_v1(
+                decode(self.get_chain_id_v1()?.completed_lower_hex()).map_err(ToolError::Decode)?,
+            );
+        } else {
+            return Err(ToolError::Customize("Invalid version".to_string()));
+        }
+
+        tx.set_version(version);
+
         Ok(tx)
     }
 
@@ -291,7 +316,8 @@ impl Client {
             encode(
                 tx.build_unverified(*self.private_key().ok_or_else(|| ToolError::Customize(
                     "The provided private key do not match the algorithm".to_string(),
-                ))?).write_to_bytes()
+                ))?)
+                .write_to_bytes()
                 .map_err(ToolError::Proto)?
             )
         ))
@@ -306,7 +332,8 @@ impl Client {
                     decode(remove_0x(param))
                         .map_err(ToolError::Decode)?
                         .as_slice()
-                ).map_err(ToolError::Proto)?
+                )
+                .map_err(ToolError::Proto)?
                 .write_to_bytes()
                 .map_err(ToolError::Proto)?
             )
@@ -315,7 +342,8 @@ impl Client {
             .insert(
                 "method",
                 ParamsValue::String(String::from(SEND_RAW_TRANSACTION)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(byte_code)]),
             );
@@ -328,13 +356,15 @@ impl Client {
             decode(remove_0x(param))
                 .map_err(ToolError::Decode)?
                 .as_slice(),
-        ).map_err(ToolError::Proto)?;
+        )
+        .map_err(ToolError::Proto)?;
         let byte_code = self.generate_sign_transaction(&tx)?;
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(SEND_RAW_TRANSACTION)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(byte_code)]),
             );
@@ -343,18 +373,44 @@ impl Client {
 
     /// Get chain id
     pub fn get_chain_id(&mut self) -> Result<u32, ToolError> {
-        if self.chain_id.is_some() {
-            Ok(self.chain_id.unwrap())
+        if self.chain_id.is_some() && self.check_chain_id() {
+            Ok(self.chain_id.unwrap().low_u32())
         } else if let Some(ResponseValue::Map(mut value)) = self.get_metadata("latest")?.result() {
             match value.remove("chainId").unwrap() {
                 ParamsValue::Int(chain_id) => {
-                    self.chain_id = Some(chain_id as u32);
+                    self.chain_id = Some(U256::from(chain_id));
                     return Ok(chain_id as u32);
                 }
                 _ => return Ok(0),
             }
         } else {
             Ok(0)
+        }
+    }
+
+    #[inline]
+    fn check_chain_id(&self) -> bool {
+        self.chain_id
+            .map(|id| id > U256::from(u32::max_value()))
+            .unwrap_or(false)
+    }
+
+    /// Get chain id v1
+    pub fn get_chain_id_v1(&mut self) -> Result<U256, ToolError> {
+        if self.chain_id.is_some() {
+            Ok(self.chain_id.unwrap())
+        } else if let Some(ResponseValue::Map(mut value)) = self.get_metadata("latest")?.result() {
+            match value.remove("chainIdV1") {
+                Some(ParamsValue::String(chain_id)) => {
+                    let chain_id = U256::from_str(remove_0x(&chain_id))
+                        .map_err(|e| ToolError::Customize(e.to_string()))?;
+                    self.chain_id = Some(chain_id);
+                    return Ok(chain_id);
+                }
+                _ => return Ok(U256::zero()),
+            }
+        } else {
+            Ok(U256::zero())
         }
     }
 
@@ -381,7 +437,8 @@ impl Client {
                 "0xffffffffffffffffffffffffffffffffff020011",
                 Some("0x0d8e6e2c"),
                 "latest",
-            )?.result()
+            )?
+            .result()
         {
             Ok(u32::from_str_radix(remove_0x(&version), 16).map_err(ToolError::Parse)?)
         } else {
@@ -439,6 +496,7 @@ impl Default for Client {
 ///
 /// JSONRPC methods:
 ///   * peerCount
+///   * peersInfo
 ///   * blockNumber
 ///   * sendTransaction
 ///   * getBlockByHash
@@ -460,26 +518,27 @@ impl Default for Client {
 ///   * getMetaData
 ///   * getBlockHeader
 ///   * getStateProof
+///   * getStorageAt
+///   * getVersion
 pub trait ClientExt<T, E>
 where
     T: serde::Serialize + serde::Deserialize<'static> + ::std::fmt::Display,
     E: Fail,
 {
-    /// Rpc response
-    type RpcResult;
-
     /// peerCount: Get network peer count
-    fn get_peer_count(&self) -> Self::RpcResult;
+    fn get_peer_count(&self) -> Result<T, E>;
+    /// peersInfo: Get all peers information
+    fn get_peers_info(&self) -> Result<T, E>;
     /// blockNumber: Get current height
-    fn get_block_number(&self) -> Self::RpcResult;
-    /// sendTransaction: Send a transaction return transaction hash
-    fn send_raw_transaction(&mut self, transaction_option: TransactionOptions) -> Self::RpcResult;
+    fn get_block_number(&self) -> Result<T, E>;
+    /// sendTransaction: Send a transaction and return transaction hash
+    fn send_raw_transaction(&mut self, transaction_option: TransactionOptions) -> Result<T, E>;
     /// getBlockByHash: Get block by hash
-    fn get_block_by_hash(&self, hash: &str, transaction_info: bool) -> Self::RpcResult;
+    fn get_block_by_hash(&self, hash: &str, transaction_info: bool) -> Result<T, E>;
     /// getBlockByNumber: Get block by number
-    fn get_block_by_number(&self, height: &str, transaction_info: bool) -> Self::RpcResult;
+    fn get_block_by_number(&self, height: &str, transaction_info: bool) -> Result<T, E>;
     /// getTransactionReceipt: Get transaction receipt
-    fn get_transaction_receipt(&self, hash: &str) -> Self::RpcResult;
+    fn get_transaction_receipt(&self, hash: &str) -> Result<T, E>;
     /// getLogs: Get logs
     fn get_logs(
         &self,
@@ -487,25 +546,19 @@ where
         address: Option<Vec<&str>>,
         from: Option<&str>,
         to: Option<&str>,
-    ) -> Self::RpcResult;
+    ) -> Result<T, E>;
     /// call: (readonly, will not save state change)
-    fn call(
-        &self,
-        from: Option<&str>,
-        to: &str,
-        data: Option<&str>,
-        height: &str,
-    ) -> Self::RpcResult;
+    fn call(&self, from: Option<&str>, to: &str, data: Option<&str>, height: &str) -> Result<T, E>;
     /// getTransaction: Get transaction by hash
-    fn get_transaction(&self, hash: &str) -> Self::RpcResult;
+    fn get_transaction(&self, hash: &str) -> Result<T, E>;
     /// getTransactionCount: Get transaction count of an account
-    fn get_transaction_count(&self, address: &str, height: &str) -> Self::RpcResult;
+    fn get_transaction_count(&self, address: &str, height: &str) -> Result<T, E>;
     /// getCode: Get the code of a contract
-    fn get_code(&self, address: &str, height: &str) -> Self::RpcResult;
+    fn get_code(&self, address: &str, height: &str) -> Result<T, E>;
     /// getAbi: Get the ABI of a contract
-    fn get_abi(&self, address: &str, height: &str) -> Self::RpcResult;
+    fn get_abi(&self, address: &str, height: &str) -> Result<T, E>;
     /// getBalance: Get the balance of a contract (TODO: return U256)
-    fn get_balance(&self, address: &str, height: &str) -> Self::RpcResult;
+    fn get_balance(&self, address: &str, height: &str) -> Result<T, E>;
     /// newFilter:
     fn new_filter(
         &self,
@@ -513,54 +566,68 @@ where
         address: Option<Vec<&str>>,
         from: Option<&str>,
         to: Option<&str>,
-    ) -> Self::RpcResult;
+    ) -> Result<T, E>;
     /// newBlockFilter:
-    fn new_block_filter(&self) -> Self::RpcResult;
+    fn new_block_filter(&self) -> Result<T, E>;
     /// uninstallFilter: Uninstall a filter by its id
-    fn uninstall_filter(&self, filter_id: &str) -> Self::RpcResult;
+    fn uninstall_filter(&self, filter_id: &str) -> Result<T, E>;
     /// getFilterChanges: Get filter changes
-    fn get_filter_changes(&self, filter_id: &str) -> Self::RpcResult;
+    fn get_filter_changes(&self, filter_id: &str) -> Result<T, E>;
     /// getFilterLogs: Get filter logs
-    fn get_filter_logs(&self, filter_id: &str) -> Self::RpcResult;
+    fn get_filter_logs(&self, filter_id: &str) -> Result<T, E>;
     /// getTransactionProof: Get proof of a transaction
-    fn get_transaction_proof(&self, hash: &str) -> Self::RpcResult;
+    fn get_transaction_proof(&self, hash: &str) -> Result<T, E>;
     /// getMetaData: Get metadata
-    fn get_metadata(&self, height: &str) -> Self::RpcResult;
+    fn get_metadata(&self, height: &str) -> Result<T, E>;
     /// getBlockHeader: Get block headers based on block height
-    fn get_block_header(&self, height: &str) -> Self::RpcResult;
+    fn get_block_header(&self, height: &str) -> Result<T, E>;
     /// getStateProof: Get the proof of the variable at the specified height
-    fn get_state_proof(&self, address: &str, key: &str, height: &str) -> Self::RpcResult;
+    fn get_state_proof(&self, address: &str, key: &str, height: &str) -> Result<T, E>;
     /// getStorageAt: Get the value of the key at the specified height
-    fn get_storage_at(&self, address: &str, key: &str, height: &str) -> Self::RpcResult;
+    fn get_storage_at(&self, address: &str, key: &str, height: &str) -> Result<T, E>;
+    /// getVersion: Get release version info of all modules
+    fn get_version(&self) -> Result<T, E>;
 }
 
 impl ClientExt<JsonRpcResponse, ToolError> for Client {
-    type RpcResult = Result<JsonRpcResponse, ToolError>;
-
-    fn get_peer_count(&self) -> Self::RpcResult {
+    fn get_peer_count(&self) -> Result<JsonRpcResponse, ToolError> {
         let params =
             JsonRpcParams::new().insert("method", ParamsValue::String(String::from(PEER_COUNT)));
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_block_number(&self) -> Self::RpcResult {
+    fn get_peers_info(&self) -> Result<JsonRpcResponse, ToolError> {
+        let params =
+            JsonRpcParams::new().insert("method", ParamsValue::String(String::from(PEERS_INFO)));
+        Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
+    }
+
+    fn get_block_number(&self) -> Result<JsonRpcResponse, ToolError> {
         let params =
             JsonRpcParams::new().insert("method", ParamsValue::String(String::from(BLOCK_NUMBER)));
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn send_raw_transaction(&mut self, transaction_option: TransactionOptions) -> Self::RpcResult {
+    fn send_raw_transaction(
+        &mut self,
+        transaction_option: TransactionOptions,
+    ) -> Result<JsonRpcResponse, ToolError> {
         let tx = self.generate_transaction(transaction_option)?;
         let byte_code = self.generate_sign_transaction(&tx)?;
         Ok(self.send_signed_transaction(&byte_code)?)
     }
 
-    fn get_block_by_hash(&self, hash: &str, transaction_info: bool) -> Self::RpcResult {
+    fn get_block_by_hash(
+        &self,
+        hash: &str,
+        transaction_info: bool,
+    ) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(GET_BLOCK_BY_HASH)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![
                     ParamsValue::String(String::from(hash)),
@@ -570,12 +637,17 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_block_by_number(&self, height: &str, transaction_info: bool) -> Self::RpcResult {
+    fn get_block_by_number(
+        &self,
+        height: &str,
+        transaction_info: bool,
+    ) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(GET_BLOCK_BY_NUMBER)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![
                     ParamsValue::String(String::from(height)),
@@ -585,12 +657,13 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_transaction_receipt(&self, hash: &str) -> Self::RpcResult {
+    fn get_transaction_receipt(&self, hash: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(GET_TRANSACTION_RECEIPT)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(String::from(hash))]),
             );
@@ -603,7 +676,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         address: Option<Vec<&str>>,
         from: Option<&str>,
         to: Option<&str>,
-    ) -> Self::RpcResult {
+    ) -> Result<JsonRpcResponse, ToolError> {
         let mut object = HashMap::new();
         object.insert(
             String::from("fromBlock"),
@@ -641,7 +714,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         to: &str,
         data: Option<&str>,
         height: &str,
-    ) -> Self::RpcResult {
+    ) -> Result<JsonRpcResponse, ToolError> {
         let mut object = HashMap::new();
 
         object.insert(String::from("to"), ParamsValue::String(String::from(to)));
@@ -669,7 +742,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_transaction(&self, hash: &str) -> Self::RpcResult {
+    fn get_transaction(&self, hash: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert("method", ParamsValue::String(String::from(GET_TRANSACTION)))
             .insert(
@@ -680,12 +753,17 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_transaction_count(&self, address: &str, height: &str) -> Self::RpcResult {
+    fn get_transaction_count(
+        &self,
+        address: &str,
+        height: &str,
+    ) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(GET_TRANSACTION_COUNT)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![
                     ParamsValue::String(String::from(address)),
@@ -696,7 +774,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_code(&self, address: &str, height: &str) -> Self::RpcResult {
+    fn get_code(&self, address: &str, height: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert("method", ParamsValue::String(String::from(GET_CODE)))
             .insert(
@@ -710,7 +788,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_abi(&self, address: &str, height: &str) -> Self::RpcResult {
+    fn get_abi(&self, address: &str, height: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert("method", ParamsValue::String(String::from(GET_ABI)))
             .insert(
@@ -724,7 +802,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_balance(&self, address: &str, height: &str) -> Self::RpcResult {
+    fn get_balance(&self, address: &str, height: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert("method", ParamsValue::String(String::from(GET_BALANCE)))
             .insert(
@@ -744,7 +822,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         address: Option<Vec<&str>>,
         from: Option<&str>,
         to: Option<&str>,
-    ) -> Self::RpcResult {
+    ) -> Result<JsonRpcResponse, ToolError> {
         let mut object = HashMap::new();
         object.insert(
             String::from("fromBlock"),
@@ -769,7 +847,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn new_block_filter(&self) -> Self::RpcResult {
+    fn new_block_filter(&self) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new().insert(
             "method",
             ParamsValue::String(String::from(NEW_BLOCK_FILTER)),
@@ -777,12 +855,13 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn uninstall_filter(&self, filter_id: &str) -> Self::RpcResult {
+    fn uninstall_filter(&self, filter_id: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(UNINSTALL_FILTER)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(String::from(filter_id))]),
             );
@@ -790,12 +869,13 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_filter_changes(&self, filter_id: &str) -> Self::RpcResult {
+    fn get_filter_changes(&self, filter_id: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(GET_FILTER_CHANGES)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(String::from(filter_id))]),
             );
@@ -803,7 +883,7 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_filter_logs(&self, filter_id: &str) -> Self::RpcResult {
+    fn get_filter_logs(&self, filter_id: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert("method", ParamsValue::String(String::from(GET_FILTER_LOGS)))
             .insert(
@@ -813,40 +893,48 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_transaction_proof(&self, hash: &str) -> Self::RpcResult {
+    fn get_transaction_proof(&self, hash: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "method",
                 ParamsValue::String(String::from(GET_TRANSACTION_PROOF)),
-            ).insert(
+            )
+            .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(String::from(hash))]),
             );
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_metadata(&self, height: &str) -> Self::RpcResult {
+    fn get_metadata(&self, height: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(String::from(height))]),
-            ).insert("method", ParamsValue::String(String::from(GET_META_DATA)));
+            )
+            .insert("method", ParamsValue::String(String::from(GET_META_DATA)));
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_block_header(&self, height: &str) -> Self::RpcResult {
+    fn get_block_header(&self, height: &str) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "params",
                 ParamsValue::List(vec![ParamsValue::String(String::from(height))]),
-            ).insert(
+            )
+            .insert(
                 "method",
                 ParamsValue::String(String::from(GET_BLOCK_HEADER)),
             );
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_state_proof(&self, address: &str, key: &str, height: &str) -> Self::RpcResult {
+    fn get_state_proof(
+        &self,
+        address: &str,
+        key: &str,
+        height: &str,
+    ) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "params",
@@ -855,11 +943,17 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
                     ParamsValue::String(String::from(key)),
                     ParamsValue::String(String::from(height)),
                 ]),
-            ).insert("method", ParamsValue::String(String::from(GET_STATE_PROOF)));
+            )
+            .insert("method", ParamsValue::String(String::from(GET_STATE_PROOF)));
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 
-    fn get_storage_at(&self, address: &str, key: &str, height: &str) -> Self::RpcResult {
+    fn get_storage_at(
+        &self,
+        address: &str,
+        key: &str,
+        height: &str,
+    ) -> Result<JsonRpcResponse, ToolError> {
         let params = JsonRpcParams::new()
             .insert(
                 "params",
@@ -868,22 +962,26 @@ impl ClientExt<JsonRpcResponse, ToolError> for Client {
                     ParamsValue::String(String::from(key)),
                     ParamsValue::String(String::from(height)),
                 ]),
-            ).insert("method", ParamsValue::String(String::from(GET_STORAGE_AT)));
+            )
+            .insert("method", ParamsValue::String(String::from(GET_STORAGE_AT)));
+        Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
+    }
+
+    fn get_version(&self) -> Result<JsonRpcResponse, ToolError> {
+        let params =
+            JsonRpcParams::new().insert("method", ParamsValue::String(String::from(GET_VERSION)));
         Ok(self.send_request(vec![params].into_iter())?.pop().unwrap())
     }
 }
 
 /// Store data or contract ABI to chain
-pub trait StoreExt: ClientExt<JsonRpcResponse, ToolError> {
+pub trait StoreExt<T, E>: ClientExt<T, E>
+where
+    T: serde::Serialize + serde::Deserialize<'static> + ::std::fmt::Display,
+    E: Fail + From<ToolError>,
+{
     /// Store data to chain, data can be get back by `getTransaction` rpc call
-    fn store_data(&mut self, content: &str, quota: Option<u64>) -> Self::RpcResult;
-
-    /// Store contract ABI to chain, ABI can be get back by `getAbi` rpc call
-    fn store_abi(&mut self, address: &str, content: String, quota: Option<u64>) -> Self::RpcResult;
-}
-
-impl StoreExt for Client {
-    fn store_data(&mut self, content: &str, quota: Option<u64>) -> Self::RpcResult {
+    fn store_data(&mut self, content: &str, quota: Option<u64>) -> Result<T, E> {
         let tx_options = TransactionOptions::new()
             .set_code(content)
             .set_address(STORE_ADDRESS)
@@ -891,7 +989,8 @@ impl StoreExt for Client {
         self.send_raw_transaction(tx_options)
     }
 
-    fn store_abi(&mut self, address: &str, content: String, quota: Option<u64>) -> Self::RpcResult {
+    /// Store contract ABI to chain, ABI can be get back by `getAbi` rpc call
+    fn store_abi(&mut self, address: &str, content: String, quota: Option<u64>) -> Result<T, E> {
         let address = remove_0x(address);
         let content_abi = encode_params(&["string".to_owned()], &[content], false)?;
         let data = format!("0x{}{}", address, content_abi);
@@ -903,29 +1002,16 @@ impl StoreExt for Client {
     }
 }
 
+impl StoreExt<JsonRpcResponse, ToolError> for Client {}
+
 /// Amend(Update) ABI/contract code/H256KV
-pub trait AmendExt: ClientExt<JsonRpcResponse, ToolError> {
+pub trait AmendExt<T, E>: ClientExt<T, E>
+where
+    T: serde::Serialize + serde::Deserialize<'static> + ::std::fmt::Display,
+    E: Fail + From<ToolError>,
+{
     /// Amend contract code
-    fn amend_code(&mut self, address: &str, content: &str, quota: Option<u64>) -> Self::RpcResult;
-
-    /// Amend contract ABI
-    fn amend_abi(&mut self, address: &str, content: String, quota: Option<u64>) -> Self::RpcResult;
-
-    /// Amend H256KV
-    fn amend_h256kv(&mut self, address: &str, h256_kv: &str, quota: Option<u64>)
-        -> Self::RpcResult;
-
-    /// Amend account balance
-    fn amend_balance(
-        &mut self,
-        address: &str,
-        balance: U256,
-        quota: Option<u64>,
-    ) -> Self::RpcResult;
-}
-
-impl AmendExt for Client {
-    fn amend_code(&mut self, address: &str, content: &str, quota: Option<u64>) -> Self::RpcResult {
+    fn amend_code(&mut self, address: &str, content: &str, quota: Option<u64>) -> Result<T, E> {
         let address = remove_0x(address);
         let content = remove_0x(content);
         let data = format!("0x{}{}", address, content);
@@ -937,7 +1023,8 @@ impl AmendExt for Client {
         self.send_raw_transaction(tx_options)
     }
 
-    fn amend_abi(&mut self, address: &str, content: String, quota: Option<u64>) -> Self::RpcResult {
+    /// Amend contract ABI
+    fn amend_abi(&mut self, address: &str, content: String, quota: Option<u64>) -> Result<T, E> {
         let address = remove_0x(address);
         let content_abi = encode_params(&["string".to_owned()], &[content], false)?;
         let data = format!("0x{}{}", address, content_abi);
@@ -949,12 +1036,8 @@ impl AmendExt for Client {
         self.send_raw_transaction(tx_options)
     }
 
-    fn amend_h256kv(
-        &mut self,
-        address: &str,
-        h256_kv: &str,
-        quota: Option<u64>,
-    ) -> Self::RpcResult {
+    /// Amend H256KV
+    fn amend_h256kv(&mut self, address: &str, h256_kv: &str, quota: Option<u64>) -> Result<T, E> {
         let address = remove_0x(address);
         let data = format!("0x{}{}", address, h256_kv);
         let tx_options = TransactionOptions::new()
@@ -965,14 +1048,10 @@ impl AmendExt for Client {
         self.send_raw_transaction(tx_options)
     }
 
-    fn amend_balance(
-        &mut self,
-        address: &str,
-        balance: U256,
-        quota: Option<u64>,
-    ) -> Self::RpcResult {
+    /// Amend account balance
+    fn amend_balance(&mut self, address: &str, balance: U256, quota: Option<u64>) -> Result<T, E> {
         let address = remove_0x(address);
-        let data = format!("0x{}{:0>64}", address, balance.lower_hex());
+        let data = format!("0x{}{}", address, balance.completed_lower_hex());
         let tx_options = TransactionOptions::new()
             .set_code(&data)
             .set_address(AMEND_ADDRESS)
@@ -982,10 +1061,16 @@ impl AmendExt for Client {
     }
 }
 
+impl AmendExt<JsonRpcResponse, ToolError> for Client {}
+
 /// Account transfer, only applies to charge mode
-pub trait Transfer: ClientExt<JsonRpcResponse, ToolError> {
+pub trait Transfer<T, E>: ClientExt<T, E>
+where
+    T: serde::Serialize + serde::Deserialize<'static> + ::std::fmt::Display,
+    E: Fail,
+{
     /// Account transfer, only applies to charge mode
-    fn transfer(&mut self, value: U256, address: &str, quota: Option<u64>) -> Self::RpcResult {
+    fn transfer(&mut self, value: U256, address: &str, quota: Option<u64>) -> Result<T, E> {
         let tx_options = TransactionOptions::new()
             .set_address(address)
             .set_quota(quota)
@@ -994,4 +1079,15 @@ pub trait Transfer: ClientExt<JsonRpcResponse, ToolError> {
     }
 }
 
-impl Transfer for Client {}
+impl Transfer<JsonRpcResponse, ToolError> for Client {}
+
+#[cfg(feature = "tls")]
+pub(crate) fn create_client() -> HyperClient<HttpsConnector<HttpConnector>> {
+    let https = HttpsConnector::new(4).unwrap();
+    HyperClient::builder().build::<_, Body>(https)
+}
+
+#[cfg(not(feature = "tls"))]
+pub(crate) fn create_client() -> HyperClient<HttpConnector> {
+    HyperClient::new()
+}
